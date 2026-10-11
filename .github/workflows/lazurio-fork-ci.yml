@@ -1,0 +1,278 @@
+name: Lazurio Fork CI
+
+# Read-only CI for the Lazurio overlay on upstream Vaultwarden: the overlay sits on
+# the exact upstream tag, changes only reviewed files, passes the Rust checks, and
+# its release image builds and enforces the SSO_ONLY exemption.
+# Runbook: docs/lazurio-fork-release.md.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lazurio-fork-ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Upstream Vaultwarden tags have no `v` prefix and are annotated; this is the tag's commit.
+  UPSTREAM_TAG: "1.37.4"
+  UPSTREAM_SHA: 7c188967e7a467b19b2757bc3326f9cf3ccae327
+
+jobs:
+  overlay:
+    name: Overlay on the upstream tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Fetch exact source and upstream base without credentials
+        env:
+          SOURCE_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+          SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+        run: |
+          set -euo pipefail
+          git init -q .
+          git remote add source "https://github.com/${SOURCE_REPOSITORY}.git"
+          git fetch -q --filter=blob:none source "$SOURCE_REF"
+          git checkout -q --detach FETCH_HEAD
+          test "$(git rev-parse HEAD)" = "$SOURCE_REF"
+
+          git remote add upstream https://github.com/dani-garcia/vaultwarden.git
+          git fetch -q --filter=blob:none --no-tags upstream \
+            "refs/tags/$UPSTREAM_TAG:refs/tags/upstream-$UPSTREAM_TAG"
+          test "$(git rev-parse "refs/tags/upstream-$UPSTREAM_TAG^{commit}")" = "$UPSTREAM_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          test "$(git rev-list --merges "$UPSTREAM_SHA..HEAD" --count)" = 0
+
+          # Every path the overlay changes is a reviewed decision (see the overlay
+          # table in the runbook). Any other changed path fails.
+          allowed_changes=(
+            # sso: technical accounts beside SSO_ONLY. Proposed upstream; drop when
+            # upstream ships an equivalent.
+            .env.template
+            src/api/core/accounts.rs
+            src/api/core/emergency_access.rs
+            src/api/core/organizations.rs
+            src/api/core/public.rs
+            src/api/identity.rs
+            src/auth.rs
+            src/config.rs
+            src/mail.rs
+            # release: Lazurio distribution.
+            .github/workflows/lazurio-fork-ci.yml
+            .github/workflows/lazurio-release.yml
+            docs/lazurio-fork-release.md
+          )
+          unexpected="$(git diff --no-renames --name-only "$UPSTREAM_SHA" HEAD |
+            grep -vxF -f <(printf '%s\n' "${allowed_changes[@]}") || true)"
+          if [ -n "$unexpected" ]; then
+            echo "The fork overlay changed files outside its allowlist:" >&2
+            echo "$unexpected" >&2
+            exit 1
+          fi
+          git log --no-merges --format='%h %s' "$UPSTREAM_SHA..HEAD"
+
+  rust:
+    name: Format, lint and test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      # The features of the release image (docker/Dockerfile.debian, DB).
+      FEATURES: sqlite,mysql,postgresql
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libmariadb-dev-compat libpq-dev libssl-dev openssl pkg-config
+
+      - name: Checkout the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          set -euo pipefail
+          toolchain="$(grep -m1 -oP 'channel\s*=\s*"\K[^"]+' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt,clippy --no-self-update
+          rustc -vV
+          cargo -vV
+
+      - name: Rust caching
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: "lazurio-v1-rust"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --profile ci --features "$FEATURES"
+
+      - name: Test
+        run: cargo test --profile ci --features "$FEATURES"
+
+  image:
+    name: Release image and overlay smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      IMAGE: lazurio/vaultwarden:ci
+    steps:
+      - name: Checkout the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      # The same Dockerfile and build arguments as the release, under the
+      # never-released version <upstream>-lazurio.0. Nothing is published.
+      - name: Build the release image without publishing
+        run: |
+          set -euo pipefail
+          docker build \
+            --file docker/Dockerfile.debian \
+            --build-arg VW_VERSION="${UPSTREAM_TAG}-lazurio.0" \
+            --tag "$IMAGE" \
+            .
+
+      # Without an identity provider: the version, the configuration check, and
+      # what SSO_ONLY with SSO_ONLY_EXEMPT_EMAILS and SSO_ONLY_API_KEY allow and
+      # refuse, including a change of the exemption while an email change is
+      # pending. The SSO side (an exempt address is never signed in through SSO,
+      # a person's API key) is covered by the lab in the runbook.
+      - name: Smoke-test the overlay in the image
+        run: |
+          set -euo pipefail
+          base=http://127.0.0.1:8080
+          work="$(mktemp -d)"
+
+          docker run --rm --network none --entrypoint /vaultwarden "$IMAGE" --version | tee "$work/version"
+          grep -Fx "Vaultwarden ${UPSTREAM_TAG}-lazurio.0" "$work/version"
+
+          # An invalid SSO_ONLY_EXEMPT_EMAILS stops the server at startup.
+          status=0
+          timeout 60 docker run --rm --network none -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+            -e 'SSO_ONLY_EXEMPT_EMAILS=svc@(example' --entrypoint /vaultwarden "$IMAGE" > "$work/invalid" 2>&1 || status=$?
+          test "$status" = 12
+          grep -F "\`SSO_ONLY_EXEMPT_EMAILS\` is invalid" "$work/invalid"
+
+          admin_token="ci-$(openssl rand -hex 16)"
+          docker run -d --name vw-overlay-smoke -p 127.0.0.1:8080:80 \
+            -e DOMAIN="$base" -e I_REALLY_WANT_VOLATILE_STORAGE=true -e ADMIN_TOKEN="$admin_token" \
+            -e SIGNUPS_ALLOWED=false -e INVITATIONS_ALLOWED=false \
+            -e SSO_ENABLED=true -e SSO_ONLY=true -e SSO_AUTHORITY=https://sso.invalid \
+            -e SSO_CLIENT_ID=ci -e SSO_CLIENT_SECRET=ci \
+            -e 'SSO_ONLY_EXEMPT_EMAILS=svc-[a-z0-9-]+@ci\.example' -e SSO_ONLY_API_KEY=true \
+            "$IMAGE" > /dev/null
+          trap 'docker logs vw-overlay-smoke 2>&1 | tail -n 40; docker rm -f -v vw-overlay-smoke > /dev/null 2>&1 || true' EXIT
+          for _ in $(seq 90); do curl -fsS "$base/alive" > /dev/null 2>&1 && break; sleep 1; done
+          curl -fsS "$base/alive" > /dev/null
+
+          call() { # call <name> <method> <path> [json] [bearer]: body to $work/<name>, prints the status
+            local args=(-sS -o "$work/$1" -w '%{http_code}' -X "$2" -H 'Accept: application/json')
+            if [ -n "${4:-}" ]; then args+=(-H 'Content-Type: application/json' --data "$4"); fi
+            if [ -n "${5:-}" ]; then args+=(-H "Authorization: Bearer $5"); fi
+            curl "${args[@]}" "$base$3"
+          }
+          token() { # token <name> <form fields...>: body to $work/<name>, prints the status
+            local name="$1"
+            shift
+            local args=(-sS -o "$work/$name" -w '%{http_code}')
+            for field in "$@"; do args+=(--data-urlencode "$field"); done
+            curl "${args[@]}" "$base/identity/connect/token"
+          }
+          expect() { # expect <check> <want status> <got status> [body name] [message in body]
+            if [ "$3" != "$2" ] || { [ -n "${5:-}" ] && ! grep -qF "$5" "$work/$4"; }; then
+              echo "FAIL  $1 (HTTP $3)"
+              if [ -n "${4:-}" ]; then head -c 600 "$work/$4"; echo; fi
+              exit 1
+            fi
+            echo "PASS  $1"
+          }
+          device=(scope="api offline_access" client_id=cli deviceType=8 deviceName=ci)
+
+          curl -fsS -o /dev/null -c "$work/admin" --data-urlencode "token=$admin_token" "$base/admin"
+          for email in svc-ci@ci.example person@ci.example; do
+            status="$(curl -sS -o /dev/null -w '%{http_code}' -b "$work/admin" -H 'Content-Type: application/json' \
+              --data "{\"email\":\"$email\"}" "$base/admin/invite")"
+            expect "the admin pre-authorizes $email" 200 "$status"
+          done
+
+          status="$(call person-verify POST /identity/accounts/register/send-verification-email '{"email":"person@ci.example","name":null}')"
+          expect "a person's email registration is refused under SSO_ONLY" 400 "$status" person-verify "Registration not allowed"
+
+          status="$(call svc-verify POST /identity/accounts/register/send-verification-email '{"email":"svc-ci@ci.example","name":null}')"
+          expect "the exempt address gets a registration token" 200 "$status"
+          register_token="$(jq -r . "$work/svc-verify")"
+          hash="ci-$(openssl rand -hex 16)"
+          register() {
+            printf '{"email":"%s","emailVerificationToken":"%s","kdf":0,"kdfIterations":600000,"key":"2.ci|ci|ci","masterPasswordHash":"%s"}' \
+              "$1" "$register_token" "$hash"
+          }
+          status="$(call person-finish POST /identity/accounts/register/finish "$(register person@ci.example)")"
+          expect "a person's registration is refused even with a valid token" 400 "$status" person-finish "Registration not allowed"
+          status="$(call svc-finish POST /identity/accounts/register/finish "$(register svc-ci@ci.example)")"
+          expect "the exempt address registers" 200 "$status"
+
+          status="$(token person-login grant_type=password username=person@ci.example password="$hash" deviceIdentifier="$(cat /proc/sys/kernel/random/uuid)" "${device[@]}")"
+          expect "a person cannot use the password grant" 400 "$status" person-login "SSO sign-in is required"
+          status="$(token svc-login grant_type=password username=svc-ci@ci.example password="$hash" deviceIdentifier="$(cat /proc/sys/kernel/random/uuid)" "${device[@]}")"
+          expect "the exempt address uses the password grant" 200 "$status"
+          access="$(jq -r .access_token "$work/svc-login")"
+          status="$(token svc-refresh grant_type=refresh_token refresh_token="$(jq -r .refresh_token "$work/svc-login")" client_id=cli)"
+          expect "the exempt address refreshes its password session" 200 "$status"
+
+          status="$(call svc-api-key POST /api/accounts/api-key "{\"masterPasswordHash\":\"$hash\"}" "$access")"
+          expect "the exempt address reads its API key" 200 "$status"
+          status="$(call svc-profile GET /api/accounts/profile "" "$access")"
+          expect "the exempt address reads its profile" 200 "$status"
+          status="$(token svc-key grant_type=client_credentials scope=api client_id="user.$(jq -r .id "$work/svc-profile")" \
+            client_secret="$(jq -r .apiKey "$work/svc-api-key")" deviceType=8 deviceName=ci deviceIdentifier="$(cat /proc/sys/kernel/random/uuid)")"
+          expect "the exempt address keeps its API key login with SSO_ONLY_API_KEY" 200 "$status"
+
+          status="$(call svc-email POST /api/accounts/email-token "{\"masterPasswordHash\":\"$hash\",\"newEmail\":\"svc-other@ci.example\"}" "$access")"
+          expect "no account can change its email to an exempt address" 400 "$status" svc-email "Email address not allowed"
+
+          # Only the admin creates exempt accounts: not even an organization's Directory Connector
+          # import, which INVITATIONS_ALLOWED does not gate, creates one.
+          status="$(call svc-org POST /api/organizations \
+            '{"name":"ci","billingEmail":"svc-ci@ci.example","collectionName":"2.ci|ci|ci","key":"4.ci","keys":{"publicKey":"ci","encryptedPrivateKey":"2.ci|ci|ci"},"planType":0}' "$access")"
+          expect "the exempt account creates an organization" 200 "$status" svc-org
+          org_id="$(jq -r .id "$work/svc-org")"
+          status="$(call org-api-key POST "/api/organizations/$org_id/api-key" "{\"masterPasswordHash\":\"$hash\"}" "$access")"
+          expect "its owner reads the organization API key" 200 "$status" org-api-key
+          status="$(token org-login grant_type=client_credentials scope=api.organization client_id="organization.$org_id" \
+            client_secret="$(jq -r .apiKey "$work/org-api-key")")"
+          expect "the organization API key signs in" 200 "$status" org-login
+          status="$(call org-import POST /api/public/organization/import \
+            '{"groups":[],"members":[{"email":"svc-imported@ci.example","externalId":"svc-imported","deleted":false}],"overwriteExisting":false,"largeImport":false}' \
+            "$(jq -r .access_token "$work/org-login")")"
+          expect "the Directory Connector import cannot create an exempt account" 400 "$status" org-import "Email address not eligible for invitations"
+          status="$(call imported-verify POST /identity/accounts/register/send-verification-email '{"email":"svc-imported@ci.example","name":null}')"
+          expect "so that exempt address still cannot register" 400 "$status" imported-verify "Registration not allowed"
+
+          # A pending email change cannot complete once its address becomes exempt. Without SMTP
+          # the final step checks no token, so only the second exemption check refuses it.
+          status="$(call svc-later POST /api/accounts/email-token "{\"masterPasswordHash\":\"$hash\",\"newEmail\":\"later@ci.example\"}" "$access")"
+          expect "an email change to an address that is not exempt yet is pending" 200 "$status" svc-later
+          status="$(curl -sS -o "$work/config" -w '%{http_code}' -b "$work/admin" -H 'Content-Type: application/json' \
+            --data '{"sso_only_exempt_emails":"svc-[a-z0-9-]+@ci\\.example|later@ci\\.example"}' "$base/admin/config")"
+          expect "the admin extends the exemption to that address" 200 "$status" config
+          status="$(call svc-later-finish POST /api/accounts/email \
+            "{\"masterPasswordHash\":\"$hash\",\"newMasterPasswordHash\":\"$hash\",\"newEmail\":\"later@ci.example\",\"token\":\"0\",\"key\":\"2.ci|ci|ci\"}" "$access")"
+          expect "the pending change cannot complete into the now exempt address" 400 "$status" svc-later-finish "Email address not allowed"
+          status="$(call svc-profile-after GET /api/accounts/profile "" "$access")"
+          expect "the account keeps its address" 200 "$status" svc-profile-after '"email":"svc-ci@ci.example"'
