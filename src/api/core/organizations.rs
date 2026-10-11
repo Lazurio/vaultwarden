@@ -1035,6 +1035,11 @@ async fn send_invite(
                     err!("Email domain not eligible for invitations")
                 }
 
+                // Only the admin creates accounts for addresses exempted from `SSO_ONLY`
+                if CONFIG.is_sso_only_exempt(email) {
+                    err!(format!("Email address not eligible for invitations: {}", email.escape_debug()))
+                }
+
                 if !CONFIG.mail_enabled() {
                     Invitation::new(email).save(&conn).await?;
                 }
