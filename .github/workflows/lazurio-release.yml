@@ -1,0 +1,332 @@
+name: Lazurio Vaultwarden Release
+
+# Runs when the release owner pushes a tag vX.Y.Z-lazurio.N that points into main.
+# Verifies the tag against main, the exact upstream tag X.Y.Z and the green
+# Lazurio Fork CI of its commit, then waits for approval in the protected
+# `release` environment before it builds and pushes
+# ghcr.io/lazurio/vaultwarden:X.Y.Z-lazurio.N from upstream's
+# docker/Dockerfile.debian, attests the image and publishes the GitHub Release
+# with release-evidence.json. Nothing is ever overwritten.
+# Runbook: docs/lazurio-fork-release.md.
+
+on:
+  push:
+    tags:
+      - "v*-lazurio.*"
+
+permissions: {}
+
+concurrency:
+  group: lazurio-vaultwarden-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  IMAGE: ghcr.io/lazurio/vaultwarden
+  RELEASE_TAG: ${{ github.ref_name }}
+
+jobs:
+  verify:
+    name: Verify tag, source and CI
+    if: github.repository == 'Lazurio/vaultwarden'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read # Read the Lazurio Fork CI runs of the tagged commit
+      contents: read # Read main, the tag and the published releases
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      source_sha: ${{ steps.verify.outputs.source_sha }}
+      upstream_tag: ${{ steps.verify.outputs.upstream_tag }}
+      upstream_sha: ${{ steps.verify.outputs.upstream_sha }}
+    steps:
+      - id: verify
+        name: Verify the tag, its source and the version
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAGGED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v(([0-9]+\.[0-9]+\.[0-9]+)-lazurio\.([1-9][0-9]*))$ ]]; then
+            echo "$RELEASE_TAG is not a release tag vX.Y.Z-lazurio.N (N >= 1)." >&2
+            exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          upstream_tag="${BASH_REMATCH[2]}"
+
+          git init -q .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          git fetch -q --filter=blob:none --no-tags origin \
+            "refs/heads/main:refs/remotes/origin/main" \
+            "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          source_sha="$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+          test "$(git rev-parse "$TAGGED_SHA^{commit}")" = "$source_sha"
+          if ! git merge-base --is-ancestor "$source_sha" refs/remotes/origin/main; then
+            echo "$RELEASE_TAG points to $source_sha, which is not on main." >&2
+            exit 1
+          fi
+
+          # The source is the exact upstream tag plus the overlay, without merges.
+          git remote add upstream https://github.com/dani-garcia/vaultwarden.git
+          git fetch -q --filter=blob:none --no-tags upstream \
+            "refs/tags/$upstream_tag:refs/tags/upstream-$upstream_tag"
+          upstream_sha="$(git rev-parse "refs/tags/upstream-$upstream_tag^{commit}")"
+          git merge-base --is-ancestor "$upstream_sha" "$source_sha"
+          test "$(git rev-list --merges "$upstream_sha..$source_sha" --count)" = 0
+
+          # The CI that checked this overlay used the same upstream base.
+          ci_file="$(git show "$source_sha:.github/workflows/lazurio-fork-ci.yml")"
+          grep -Fxq "  UPSTREAM_TAG: \"$upstream_tag\"" <<< "$ci_file"
+          grep -Fxq "  UPSTREAM_SHA: $upstream_sha" <<< "$ci_file"
+
+          # Lazurio Fork CI passed on this exact commit.
+          green="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/lazurio-fork-ci.yml/runs?head_sha=$source_sha&status=success&per_page=1" \
+            --jq '.total_count')"
+          if [ "$green" -lt 1 ]; then
+            echo "Lazurio Fork CI has no successful run on $source_sha. Wait for it, then re-run this job." >&2
+            exit 1
+          fi
+
+          # Never overwrite, and only move forward.
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "A GitHub Release for $RELEASE_TAG already exists." >&2
+            exit 1
+          fi
+          key() { local a b c n; IFS='.-' read -r a b c _ n <<< "$1"; printf '%06d%06d%06d%06d' "$a" "$b" "$c" "$n"; }
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft | not) | .tag_name' |
+            { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-lazurio\.[1-9][0-9]*$' || true; } > "$RUNNER_TEMP/published"
+          while read -r published; do
+            if [[ ! "$(key "$version")" > "$(key "${published#v}")" ]]; then
+              echo "$version is not newer than the published ${published#v}." >&2
+              exit 1
+            fi
+          done < "$RUNNER_TEMP/published"
+
+          {
+            echo "version=$version"
+            echo "source_sha=$source_sha"
+            echo "upstream_tag=$upstream_tag"
+            echo "upstream_sha=$upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release $version from $source_sha on upstream $upstream_tag ($upstream_sha)."
+
+  publish:
+    name: Publish image and release
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    environment: release
+    permissions:
+      attestations: write # Persist the build provenance attestation
+      contents: write # Create the GitHub Release
+      id-token: write # Sign the attestation through Sigstore
+      packages: write # Push the image to GHCR
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+      SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+      UPSTREAM_TAG: ${{ needs.verify.outputs.upstream_tag }}
+      UPSTREAM_SHA: ${{ needs.verify.outputs.upstream_sha }}
+      # Set only in the protected `release` environment. An environment that
+      # GitHub created on the fly, without reviewers, does not have it.
+      RELEASE_CONTROL: ${{ vars.LAZURIO_VAULTWARDEN_RELEASE_CONTROL }}
+    steps:
+      # Runs after approval and before any side effect.
+      - name: Recheck the environment and the tag after approval
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_CONTROL" != "reviewed-v1" ]; then
+            echo "The release environment is not set up as the runbook says; nothing was published." >&2
+            exit 1
+          fi
+          refs="$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
+          tagged="$(awk -v peeled="refs/tags/$RELEASE_TAG^{}" '$2 == peeled {print $1}' <<< "$refs")"
+          [ -n "$tagged" ] || tagged="$(awk '{print $1; exit}' <<< "$refs")"
+          if [ "$tagged" != "$SOURCE_SHA" ]; then
+            echo "$RELEASE_TAG moved away from $SOURCE_SHA since verification; nothing was published." >&2
+            exit 1
+          fi
+
+      - name: Checkout the release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          fetch-depth: 0 # The release notes list the overlay commits since the upstream tag
+          persist-credentials: false
+
+      - id: source
+        name: Read the source date
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$UPSTREAM_SHA" HEAD
+          source_date_epoch="$(git show -s --format=%ct HEAD)"
+          echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
+          echo "source_date_iso=$(date -u -d "@$source_date_epoch" +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Refuse an existing image tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          versions="$RUNNER_TEMP/package-versions.json"
+          status=0
+          gh api --paginate --slurp "orgs/Lazurio/packages/container/vaultwarden/versions?per_page=100" \
+            > "$versions" 2> "$RUNNER_TEMP/package-versions.err" || status=$?
+          if (( status != 0 )); then
+            if grep -q "HTTP 404" "$RUNNER_TEMP/package-versions.err"; then
+              echo "[]" > "$versions" # The first release creates the package.
+            else
+              cat "$RUNNER_TEMP/package-versions.err" >&2
+              echo "Unable to enumerate GHCR package versions." >&2
+              exit 1
+            fi
+          fi
+          if jq -e --arg tag "$VERSION" '[.[][]? | .metadata.container.tags[]?] | index($tag) != null' "$versions" > /dev/null; then
+            echo "Image tag $IMAGE:$VERSION already exists and will not be overwritten." >&2
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      # Upstream's own Dockerfile and DB features. Only linux/amd64: the
+      # Conglomerate Hosts that run it are x86_64.
+      - id: build
+        name: Build and publish the immutable image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile.debian
+          platforms: linux/amd64
+          push: true
+          pull: true
+          no-cache: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            VW_VERSION=${{ env.VERSION }}
+          labels: |
+            org.opencontainers.image.created=${{ steps.source.outputs.source_date_iso }}
+            org.opencontainers.image.description=Vaultwarden ${{ env.UPSTREAM_TAG }} with the Lazurio overlay
+            org.opencontainers.image.licenses=AGPL-3.0-only
+            org.opencontainers.image.revision=${{ env.SOURCE_SHA }}
+            org.opencontainers.image.source=https://github.com/Lazurio/vaultwarden
+            org.opencontainers.image.url=https://github.com/Lazurio/vaultwarden
+            org.opencontainers.image.version=${{ env.VERSION }}
+
+      - name: Verify the published image
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker pull "$IMAGE@$IMAGE_DIGEST"
+          docker run --rm --network none --entrypoint /vaultwarden "$IMAGE@$IMAGE_DIGEST" --version | tee "$RUNNER_TEMP/version"
+          grep -Fx "Vaultwarden $VERSION" "$RUNNER_TEMP/version"
+          # The overlay is in the binary: an invalid exemption stops the server at startup.
+          status=0
+          timeout 60 docker run --rm --network none -e I_REALLY_WANT_VOLATILE_STORAGE=true \
+            -e 'SSO_ONLY_EXEMPT_EMAILS=svc@(example' --entrypoint /vaultwarden "$IMAGE@$IMAGE_DIGEST" \
+            > "$RUNNER_TEMP/invalid" 2>&1 || status=$?
+          test "$status" = 12
+          grep -F "\`SSO_ONLY_EXEMPT_EMAILS\` is invalid" "$RUNNER_TEMP/invalid"
+
+      - id: attest
+        name: Attest the published image
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Assemble release notes and evidence
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+          ATTESTATION_URL: ${{ steps.attest.outputs.attestation-url }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/release"
+          # shellcheck disable=SC2016 # $names below are jq variables
+          jq -n --sort-keys \
+            --arg repository "https://github.com/$GITHUB_REPOSITORY" \
+            --arg source "$SOURCE_SHA" \
+            --arg tag "$RELEASE_TAG" \
+            --arg version "$VERSION" \
+            --arg upstream_tag "$UPSTREAM_TAG" \
+            --arg upstream_sha "$UPSTREAM_SHA" \
+            --arg image "$IMAGE" \
+            --arg digest "$IMAGE_DIGEST" \
+            --arg attestation "$ATTESTATION_URL" \
+            --arg run "$RUN_URL" \
+            '{
+              schema_version: "lazurio.vaultwarden.fork-release.v1",
+              source: {
+                repository: $repository,
+                commit: $source,
+                tag: $tag,
+                version: $version,
+                license: "AGPL-3.0-only",
+                upstream_repository: "https://github.com/dani-garcia/vaultwarden",
+                upstream_release: $upstream_tag,
+                upstream_base: $upstream_sha
+              },
+              artifact: {
+                image: $image,
+                tag: $version,
+                digest: $digest,
+                reference: ($image + ":" + $version + "@" + $digest),
+                platforms: ["linux/amd64"],
+                dockerfile: "docker/Dockerfile.debian"
+              },
+              validation: {
+                workflow_run: $run,
+                image_attestation: $attestation
+              }
+            }' > "$RUNNER_TEMP/release/release-evidence.json"
+
+          {
+            echo "Vaultwarden $UPSTREAM_TAG (upstream tag at \`$UPSTREAM_SHA\`) with the Lazurio overlay."
+            echo "Lazurio Machines pin this image by its digest."
+            echo
+            echo "- Image: \`$IMAGE:$VERSION@$IMAGE_DIGEST\` (linux/amd64)"
+            echo "- Source: \`$SOURCE_SHA\`, tag \`$RELEASE_TAG\`"
+            echo "- Image attestation: $ATTESTATION_URL"
+            echo "- Workflow run: $RUN_URL"
+            echo
+            echo "## Lazurio overlay"
+            echo
+            git log --no-merges --pretty='format:- %s (%h)' "$UPSTREAM_SHA..$SOURCE_SHA"
+            echo
+            echo
+            echo "## Source code"
+            echo
+            echo "Vaultwarden is licensed under the AGPL-3.0. This image is built from this public"
+            echo "repository at tag \`$RELEASE_TAG\`; the source code archives of this release are"
+            echo "exactly that source. See docs/lazurio-fork-release.md."
+          } > "$RUNNER_TEMP/release/RELEASE_NOTES.md"
+          cat "$RUNNER_TEMP/release/release-evidence.json"
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "Vaultwarden $RELEASE_TAG" \
+            --notes-file "$RUNNER_TEMP/release/RELEASE_NOTES.md" \
+            --latest \
+            "$RUNNER_TEMP/release/release-evidence.json"
