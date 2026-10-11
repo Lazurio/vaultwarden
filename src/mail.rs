@@ -304,7 +304,7 @@ pub async fn send_invite(
             .append_pair("organizationUserId", &member_id)
             .append_pair("token", &invite_token);
 
-        if CONFIG.sso_enabled() && CONFIG.sso_only() {
+        if CONFIG.is_sso_required(&user.email) {
             query_params.append_pair("orgSsoIdentifier", &org_id);
         }
 

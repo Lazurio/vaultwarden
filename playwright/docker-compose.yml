@@ -37,6 +37,8 @@ services:
       - SSO_ENABLED
       - SSO_FRONTEND
       - SSO_ONLY
+      - SSO_ONLY_API_KEY
+      - SSO_ONLY_EXEMPT_EMAILS
       - SSO_SCOPES
     restart: "no"
     depends_on:

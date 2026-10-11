@@ -271,6 +271,12 @@ pub async fn register(data: Json<RegisterData>, conn: DbConn) -> JsonResult {
     let data: RegisterData = data.into_inner();
     let email = data.email.to_lowercase();
 
+    // With `SSO_ONLY`, only the technical accounts exempted from it may register with a master password,
+    // even when an invitation exists
+    if CONFIG.is_sso_required(&email) {
+        err!("Registration not allowed or user already exists")
+    }
+
     let mut name = None;
     let mut pending_emergency_access = None;
 
@@ -1141,6 +1147,11 @@ async fn post_email_token(data: Json<EmailTokenData>, headers: Headers, conn: Db
         err!("Email domain not allowed");
     }
 
+    // Addresses exempted from `SSO_ONLY` are reserved for the technical accounts registered with them
+    if CONFIG.is_sso_only_exempt(&data.new_email) {
+        err!("Email address not allowed");
+    }
+
     let token = crypto::generate_email_token(6);
 
     if CONFIG.mail_enabled() {
@@ -1182,6 +1193,11 @@ async fn post_email(data: Json<ChangeEmailData>, headers: Headers, conn: DbConn,
 
     if User::find_by_mail(&data.new_email, &conn).await.is_some() {
         err!("Email already in use");
+    }
+
+    // Checked again, as the exemption can change while the email change is pending
+    if CONFIG.is_sso_only_exempt(&data.new_email) {
+        err!("Email address not allowed");
     }
 
     if let Some(ref val) = user.email_new {
