@@ -90,6 +90,10 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 user
             } else {
                 // User does not exist yet
+                // Only the admin creates accounts for addresses exempted from `SSO_ONLY`
+                if CONFIG.is_sso_only_exempt(&user_data.email) {
+                    err!(format!("Email address not eligible for invitations: {}", user_data.email.escape_debug()))
+                }
                 let mut new_user = User::new(&user_data.email, None);
                 new_user.save(&conn).await?;
 

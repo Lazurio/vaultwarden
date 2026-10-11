@@ -66,7 +66,9 @@ async fn login(data: Form<ConnectData>, client_header: ClientHeaders, conn: DbCo
             check_is_some(data.refresh_token.as_ref(), "refresh_token cannot be blank")?;
             refresh_login(data, &conn, &client_header.ip).await
         }
-        "password" if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO sign-in is required"),
+        "password" if CONFIG.is_sso_required(data.username.as_deref().unwrap_or_default()) => {
+            err!("SSO sign-in is required")
+        }
         "password" => {
             check_is_some(data.client_id.as_ref(), "client_id cannot be blank")?;
             check_is_some(data.password.as_ref(), "password cannot be blank")?;
@@ -202,6 +204,18 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
     };
 
     let (sso_auth, user_infos) = sso::exchange_code(code, code_verifier, conn).await?;
+
+    // Technical accounts exempted from `SSO_ONLY` are never signed in or associated through SSO
+    if CONFIG.is_sso_only_exempt(&user_infos.email) {
+        err!(
+            "SSO sign-in is not available for this account",
+            format!("IP: {}. Username: {}.", ip.ip, user_infos.email),
+            ErrorEvent {
+                event: EventType::UserFailedLogIn
+            }
+        )
+    }
+
     let user_with_sso = match SsoUser::find_by_identifier(&user_infos.identifier, conn).await {
         None => match SsoUser::find_by_mail(&user_infos.email, conn).await {
             None => None,
@@ -277,6 +291,20 @@ async fn sso_login(data: ConnectData, user_id: &mut Option<UserId>, conn: &DbCon
         },
         Some((user, sso_user)) => Some((user, Some(sso_user))),
     };
+
+    // Checked again on the local account: it may have been associated before its address became exempt,
+    // or the provider may now return another email for the same identifier
+    if let Some((user, _)) = &user_with_sso
+        && CONFIG.is_sso_only_exempt(&user.email)
+    {
+        err!(
+            "SSO sign-in is not available for this account",
+            format!("IP: {}. Username: {}.", ip.ip, user.email),
+            ErrorEvent {
+                event: EventType::UserFailedLogIn
+            }
+        )
+    }
 
     let now = Utc::now().naive_utc();
     // Will trigger 2FA flow if needed
@@ -652,6 +680,16 @@ async fn user_api_key_login(
     if !user.check_valid_api_key(client_secret) {
         err!(
             "Incorrect client_secret",
+            format!("IP: {}. Username: {}.", ip.ip, user.email),
+            ErrorEvent {
+                event: EventType::UserFailedLogIn
+            }
+        )
+    }
+
+    if CONFIG.sso_only_api_key() && CONFIG.is_sso_required(&user.email) {
+        err!(
+            "SSO sign-in is required",
             format!("IP: {}. Username: {}.", ip.ip, user.email),
             ErrorEvent {
                 event: EventType::UserFailedLogIn
@@ -1065,6 +1103,11 @@ async fn register_verification_email(
     crate::ratelimit::check_limit_unauthenticated(&ip.ip)?;
 
     let data = data.into_inner();
+
+    // With `SSO_ONLY`, only the technical accounts exempted from it may register with a master password
+    if CONFIG.is_sso_required(&data.email) {
+        err!("Registration not allowed or user already exists")
+    }
 
     // the registration can only continue if signup is allowed or there exists an invitation
     if !(CONFIG.is_signup_allowed(&data.email)

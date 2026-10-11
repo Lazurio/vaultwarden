@@ -837,8 +837,13 @@ make_config! {
     sso {
         /// Enabled
         sso_enabled:                    bool,   true,   def,    false;
-        /// Only SSO login |> Disable Email+Master Password login
+        /// Only SSO login |> Disable Email+Master Password login and registration
         sso_only:                       bool,   true,   def,    false;
+        /// Accounts exempt from SSO only |> Regex matching the whole lowercase email address of technical accounts (automation, CLI, browser extension)
+        /// that keep the Email+Master Password login with `SSO_ONLY`. They can never log in or be associated through SSO, and no email can be changed to such an address.
+        sso_only_exempt_emails:         String, true,  option;
+        /// SSO only for API keys |> With `SSO_ONLY`, also refuse the personal API key login of every account not matched by `SSO_ONLY_EXEMPT_EMAILS`
+        sso_only_api_key:               bool,   true,   def,    false;
         /// Allow SSO flow to create account |> You probably want to disable it when using a public provider
         sso_signups_allowed:            bool,   true,   def,    true;
         /// Allow email association |> Associate existing non-SSO user based on email
@@ -1157,6 +1162,12 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         validate_sso_master_password_policy(cfg.sso_master_password_policy.as_ref())?;
     }
 
+    if let Some(ref pattern) = cfg.sso_only_exempt_emails
+        && let Err(e) = sso_only_exempt_regex(pattern)
+    {
+        err!(format!("`SSO_ONLY_EXEMPT_EMAILS` is invalid: {e:#?}"));
+    }
+
     if cfg._enable_yubico {
         if cfg.yubico_client_id.is_some() != cfg.yubico_secret_key.is_some() {
             err!("Both `YUBICO_CLIENT_ID` and `YUBICO_SECRET_KEY` must be set for Yubikey OTP support")
@@ -1398,6 +1409,21 @@ fn validate_sso_master_password_policy(
             err!(format!("Invalid sso_master_password_policy ({error}), Ensure that it's correctly escaped with ''"))
         }
     }
+}
+
+/// Compiles `SSO_ONLY_EXEMPT_EMAILS`. The pattern has to match the whole email address,
+/// so a partial match can never exempt an unrelated address.
+fn sso_only_exempt_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::Regex::new(&format!("^(?:{pattern})$"))
+}
+
+/// Tests an email address against the `SSO_ONLY_EXEMPT_EMAILS` in force. Every check calls it with the current
+/// configuration, so an address added to the pattern is exempt from the next request on, also for an account
+/// associated through SSO before.
+fn sso_only_exempt_matches(pattern: Option<&str>, email: &str) -> bool {
+    pattern
+        .and_then(|pattern| sso_only_exempt_regex(pattern).ok())
+        .is_some_and(|regex| regex.is_match(&email.trim().to_lowercase()))
 }
 
 /// Extracts an RFC 6454 web origin from a URL.
@@ -1655,6 +1681,17 @@ impl Config {
             && self.signups_domains_whitelist().is_empty()
             && (self.mail_enabled() || !self.invitations_allowed()))
             || (self.sso_enabled() && self.sso_only())
+    }
+
+    /// Tests whether an email address belongs to a technical account matched by `SSO_ONLY_EXEMPT_EMAILS`.
+    pub fn is_sso_only_exempt(&self, email: &str) -> bool {
+        sso_only_exempt_matches(self.sso_only_exempt_emails().as_deref(), email)
+    }
+
+    /// Tests whether an email address has to log in through SSO, which closes its
+    /// Email+Master Password login and registration: `SSO_ONLY` is enabled and the address is not exempt.
+    pub fn is_sso_required(&self, email: &str) -> bool {
+        self.sso_enabled() && self.sso_only() && !self.is_sso_only_exempt(email)
     }
 
     /// Tests whether the specified user is allowed to create an organization.
@@ -1943,3 +1980,56 @@ handlebars::handlebars_helper!(webver: | web_vault_version: String |
 handlebars::handlebars_helper!(vwver: | vw_version: String |
     semver::VersionReq::parse(&vw_version).expect("Invalid Vaultwarden version compare string").matches(&VW_VERSION)
 );
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sso_only_exempt_regex_matches_the_whole_address() {
+        let regex = sso_only_exempt_regex(r"svc-[a-z0-9-]+@example\.com").unwrap();
+        assert!(regex.is_match("svc-backup@example.com"));
+        assert!(!regex.is_match("svc-backup@example.com.evil.net"));
+        assert!(!regex.is_match("alice.svc-backup@example.com"));
+        assert!(!regex.is_match("alice@example.com"));
+    }
+
+    #[test]
+    fn sso_only_exempt_regex_anchors_every_alternative() {
+        let regex = sso_only_exempt_regex(r"ci@example\.com|^backup@example\.org$").unwrap();
+        assert!(regex.is_match("ci@example.com"));
+        assert!(regex.is_match("backup@example.org"));
+        assert!(!regex.is_match("ci@example.com.evil.net"));
+        assert!(!regex.is_match("evil-backup@example.org"));
+    }
+
+    #[test]
+    fn sso_only_exempt_regex_rejects_an_invalid_pattern() {
+        assert!(sso_only_exempt_regex("svc@(example").is_err());
+    }
+
+    #[test]
+    fn sso_only_exempt_follows_a_pattern_changed_after_association() {
+        // An account associated through SSO while its address was not exempt
+        let local = "alice@example.com";
+        assert!(!sso_only_exempt_matches(None, local));
+        assert!(!sso_only_exempt_matches(Some(r"svc-[a-z]+@example\.com"), local));
+        // After a restart that adds its address, every SSO sign-in and refresh checks it again
+        assert!(sso_only_exempt_matches(Some(r"svc-[a-z]+@example\.com|alice@example\.com"), local));
+    }
+
+    #[test]
+    fn sso_only_exempt_checks_the_local_address_apart_from_the_providers() {
+        // The provider returns another email for the same identifier than the exempt local account has
+        let pattern = Some(r"svc-[a-z]+@example\.com");
+        assert!(!sso_only_exempt_matches(pattern, "renamed@example.com"));
+        assert!(sso_only_exempt_matches(pattern, "svc-backup@example.com"));
+        assert!(sso_only_exempt_matches(pattern, " SVC-Backup@Example.com "));
+    }
+
+    #[test]
+    fn sso_only_exempt_matches_nothing_without_a_valid_pattern() {
+        assert!(!sso_only_exempt_matches(None, "svc-backup@example.com"));
+        assert!(!sso_only_exempt_matches(Some("svc@(example"), "svc@(example"));
+    }
+}

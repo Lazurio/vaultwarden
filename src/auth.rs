@@ -1388,6 +1388,10 @@ pub async fn refresh_tokens(
     };
 
     let auth_tokens = match refresh_claims.sub {
+        // No SSO session is refreshed for an address exempted from `SSO_ONLY`, even one that became exempt later
+        AuthMethod::Sso if CONFIG.is_sso_only_exempt(&user.email) => {
+            err!("SSO sign-in is not available for this account")
+        }
         AuthMethod::Sso if CONFIG.sso_enabled() && CONFIG.sso_auth_only_not_session() => {
             AuthTokens::new(&device, &user, refresh_claims.sub, client_id)
         }
@@ -1395,7 +1399,7 @@ pub async fn refresh_tokens(
             sso::exchange_refresh_token(&device, &user, client_id, refresh_claims).await?
         }
         AuthMethod::Sso => err!("SSO is now disabled, Login again using email and master password"),
-        AuthMethod::Password if CONFIG.sso_enabled() && CONFIG.sso_only() => err!("SSO is now required, Login again"),
+        AuthMethod::Password if CONFIG.is_sso_required(&user.email) => err!("SSO is now required, Login again"),
         AuthMethod::Password => AuthTokens::new(&device, &user, refresh_claims.sub, client_id),
         _ => err!("Invalid auth method, cannot refresh token"),
     };
