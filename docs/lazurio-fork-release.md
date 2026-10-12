@@ -21,8 +21,11 @@ Rozhodnutí DEV-6631 z 2026-10-11 (systémový návrh trezoru Environmentu):
 
 - Lidé vstupují do síťového trezoru jen přes svůj Lazurio účet (SSO). Účet
   e-mailem nikdo nezakládá a nikdo se jím nepřihlašuje.
-- Environmenty mají technické účty `vaultwarden@<adresa Environmentu>` s heslem
-  a osobním API klíčem; heslo a klíče existují jen v Environmentu. CLI `bw`
+- Environmenty mají technické účty s neuhodnutelnou adresou
+  `vaultwarden-<náhodný kód>@<adresa Environmentu>` (rozhodnutí 0197 bod 3).
+  Síť adresu vygeneruje, předem povolí a předá jen Environmentu, takže slouží
+  jako jednorázové pověření k registraci. Účty mají heslo a osobní API klíč;
+  heslo a klíče existují jen v Environmentu. CLI `bw`
   potřebuje heslo jednou, aby si vyzvedlo API klíč, a rozšíření Bitwarden v
   prohlížeči Environmentu se přihlašuje jen heslem.
 
@@ -88,8 +91,11 @@ Vizuální branding Lazuria přijde jako samostatný overlay commit s vlastním
 
 - `SSO_ONLY_EXEMPT_EMAILS` je regex, který musí odpovídat **celé** e-mailové
   adrese (malými písmeny; ukotvení `^…$` doplní server sám). Lazurio používá
-  adresy Environmentů:
-  `^vaultwarden@[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.lazurio\.io$`.
+  adresy Environmentů s náhodným kódem (26 znaků base32, 130 bitů):
+  `^vaultwarden-[a-z2-7]{26}@[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*\.lazurio\.io$`.
+  Účty dřívějšího předvídatelného tvaru `vaultwarden@<adresa Environmentu>`
+  pod vzor nespadají; síť je před zapnutím `SSO_ONLY` nahradí účty nového
+  tvaru.
   Neplatný regex server odmítne při startu (exit 12) i při uložení v `/admin`.
 - S `SSO_ONLY=true`:
   - přihlášení heslem (`grant_type=password`) a jeho obnovení přes refresh
