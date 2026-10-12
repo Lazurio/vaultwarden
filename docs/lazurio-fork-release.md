@@ -111,6 +111,20 @@ Vizuální branding Lazuria přijde jako samostatný overlay commit s vlastním
   přes `/admin/invite`) a nemění `/admin`. Webový trezor dál ukazuje lidem jen
   přihlášení přes SSO. Výjimka nemění 2FA, Auth ani nastavení organizací.
 
+**Provozní pravidlo (Pablovo review 2026-10-11).** Výjimka se vyhodnocuje
+v okamžiku požadavku. Nezaregistrovaný účet, který vznikl dřív, než jeho
+adresa spadla pod výjimku (například import na staré verzi), by si proto
+bez SMTP mohl zaregistrovat kdokoli. Lazurio to vylučuje postupem:
+
+1. Vzor se nastaví jednou na všechny adresy Environmentů a nikdy se
+   nerozšiřuje.
+2. Než ho host poprvé nastaví, apply Machines smaže nezaregistrované účty
+   a pozvánky, které vzoru odpovídají. Jejich nepřítomnost ověří readbackem
+   jako jedna uspořádaná operace, která při chybě skončí zavřeně.
+3. Teprve potom síť předem povoluje účty Environmentů.
+
+Kdo by vzor měnil, musí stejný úklid udělat znovu před změnou.
+
 Nenastavené volby zachovají upstream chování, s jedinou výjimkou: s
 `SSO_ONLY=true` už nejde e-mailová registrace. Upstream ji pouštěl, ačkoli se
 takový účet heslem stejně nepřihlásil.
@@ -338,8 +352,11 @@ Task Agent na jeho výslovný pokyn vázaný na obě SHA.
 
 ### První zavedení `main`
 
-Dnes je `main` forku upstream `main` (`64895524`), žádné vydání, takže není co
-zachytit.
+Proběhlo 2026-10-11. `main` byl upstream `main` (`64895524`), ověřený těsně
+před zápisem jako totožný s upstream `main`. Přesným lease se vyměnil na
+schválenou hlavu `520ea668` (Pablo APPROVED na přesném headu). PR #1 se
+zavřel bez sloučení a ze stejného commitu vyšlo `v1.37.4-lazurio.1`. Postup
+zůstává zapsaný pro kontrolu:
 
 1. PR `lazurio/1.37.4` → `upstream/1.37.4` (`upstream/1.37.4` je upstream tag
    `1.37.4`, commit `7c188967`) projde zeleným CI a review. Kandidát obsahuje
@@ -357,8 +374,9 @@ zachytit.
 ## Jednorázové nastavení (Admin)
 
 - Environment `release`:
-  - povinný schvalovatel Matěj (`immakermatty`), zakázané schválení vlastního
-    běhu;
+  - povinný schvalovatel Matěj (`immakermatty`). Schválení vlastního běhu je
+    povolené, protože tag vytváří Admin. Matěj 2026-10-11 pověřil agenta
+    vydat a schválit vydání jeho jménem; Steward vydání připravuje a reviewuje;
   - deployment refs jen tagy `v*-lazurio.*`;
   - proměnná `LAZURIO_VAULTWARDEN_RELEASE_CONTROL=reviewed-v1`. Publish bez ní
     skončí dřív, než cokoli zapíše. To chrání před environmentem, který by
@@ -368,7 +386,7 @@ zachytit.
   `Release image and overlay smoke test`; force push jen bypassem Organization
   Admina (přestavba a první zavedení).
 - Ruleset pro tagy `v*-lazurio.*`: zákaz update a smazání; vytvořit je smí jen
-  Steward a Admin.
+  Organization Admin (bypass).
 - Release immutability v nastavení repozitáře (Settings → General → Releases),
   aby šel starý `main` zachytit neměnným vydáním.
 - Po prvním vydání balíček `ghcr.io/lazurio/vaultwarden`: propojený s tímto
