@@ -1,8 +1,13 @@
 # Lazurio Vaultwarden: vydávání
 
-Runbook pro vlastníka vydávání Lazurio Vaultwardenu (Steward, dnes Pablo,
-`agentrozjedemeai`). Vydání připravíš a spustíš sám; Organization Admin (Matěj,
-`immakermatty`) ho jen schválí v GitHub environmentu `release`.
+Runbook pro vydávání Lazurio Vaultwardenu. Role:
+
+- **Steward** (dnes Pablo, `agentrozjedemeai`) vydání připravuje: přestavbu,
+  testy a review kandidáta.
+- **Organization Admin** (Matěj, `immakermatty`) vytvoří tag a vydání schválí
+  v GitHub environmentu `release`. Tag `v*-lazurio.*` smí vytvořit jen
+  Organization Admin. Matěj 2026-10-11 pověřil agenta, aby obojí dělal jeho
+  jménem, když k tomu dá pokyn.
 
 ## Co je tenhle fork a proč
 
@@ -199,7 +204,8 @@ Upstream soubory kvůli tomu neměň.
 
 ## Spuštění vydání
 
-Vydání spustí push tagu. Tag dávej jen na commit z `main`, na kterém je zelené
+Vydání spustí push tagu, který vytvoří Organization Admin (nebo agent jeho
+jménem). Tag dávej jen na commit z `main`, na kterém je zelené
 `Lazurio Fork CI`, typicky na jeho špičku:
 
 ```bash
@@ -248,11 +254,12 @@ nepoužívej a vydej další `N`.
 
 ## Schválení
 
-Až je `Verify tag, source and CI` zelené, požádej Matěje o schválení a pošli mu
-odkaz na běh. Matěj ho schválí v GitHubu (běh → Review deployments → `release`
-→ Approve). Jediný povinný schvalovatel je Matěj a environment zakazuje schválit
-vlastní běh, takže tag pushuješ ty, ne Matěj. Když si vydání rozmyslíš, Matěj
-běh odmítne (Reject) a nic se nepublikuje.
+Až je `Verify tag, source and CI` zelené, schválí běh Matěj (nebo agent jeho
+jménem) v GitHubu: běh → Review deployments → `release` → Approve. Stejně
+funguje API `pending_deployments`. Jediný povinný schvalovatel je Matěj.
+Environment dovoluje schválit vlastní běh, protože tag vytváří Admin. Druhou
+kontrolu dělá Steward review kandidáta před zavedením do `main`. Když si
+vydání rozmyslíš, běh odmítni (Reject) a nic se nepublikuje.
 
 ## Ověření publikovaného vydání
 
