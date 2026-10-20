@@ -2,11 +2,12 @@ name: Lazurio Vaultwarden Release
 
 # Runs when the release owner pushes a tag vX.Y.Z-lazurio.N that points into main.
 # Verifies the tag against main, the exact upstream tag X.Y.Z and the green
-# Lazurio Fork CI of its commit, then waits for approval in the protected
-# `release` environment before it builds and pushes
-# ghcr.io/lazurio/vaultwarden:X.Y.Z-lazurio.N from upstream's
-# docker/Dockerfile.debian, attests the image and publishes the GitHub Release
-# with release-evidence.json. Nothing is ever overwritten.
+# Lazurio Fork CI of its commit, and builds the patched web vault in a job without
+# write permissions. Then it waits for approval in the protected `release`
+# environment before it builds and pushes ghcr.io/lazurio/vaultwarden:X.Y.Z-lazurio.N
+# from upstream's docker/Dockerfile.debian with that web vault, attests the image
+# and publishes the GitHub Release with release-evidence.json. Nothing is ever
+# overwritten.
 # Runbook: docs/lazurio-fork-release.md.
 
 on:
@@ -114,9 +115,46 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "Release $version from $source_sha on upstream $upstream_tag ($upstream_sha)."
 
+  # npm installs the web vault's dependencies here, without write permissions and
+  # inside the Node container. Only the built files, checked against the hash
+  # this job reports, reach the publishing job.
+  web-vault:
+    name: Build the patched web vault
+    needs: verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read # Check out the release source
+    outputs:
+      files_sha256: ${{ steps.build.outputs.files_sha256 }}
+    env:
+      SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
+    steps:
+      - name: Checkout the release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.verify.outputs.source_sha }}
+          persist-credentials: false
+
+      - id: build
+        name: Build and check the patched web vault
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          lazurio/build-web-vault.sh "$RUNNER_TEMP/web-vault"
+          echo "files_sha256=$(jq -r .files_sha256 "$RUNNER_TEMP/web-vault/web-vault.json")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the web vault
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-vault
+          path: ${{ runner.temp }}/web-vault/
+          if-no-files-found: error
+          include-hidden-files: true
+
   publish:
     name: Publish image and release
-    needs: verify
+    needs: [verify, web-vault]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     environment: release
@@ -130,6 +168,7 @@ jobs:
       SOURCE_SHA: ${{ needs.verify.outputs.source_sha }}
       UPSTREAM_TAG: ${{ needs.verify.outputs.upstream_tag }}
       UPSTREAM_SHA: ${{ needs.verify.outputs.upstream_sha }}
+      WEB_VAULT_FILES_SHA256: ${{ needs.web-vault.outputs.files_sha256 }}
       # Set only in the protected `release` environment. An environment that
       # GitHub created on the fly, without reviewers, does not have it.
       RELEASE_CONTROL: ${{ vars.LAZURIO_VAULTWARDEN_RELEASE_CONTROL }}
@@ -167,6 +206,22 @@ jobs:
           echo "source_date_epoch=$source_date_epoch" >> "$GITHUB_OUTPUT"
           echo "source_date_iso=$(date -u -d "@$source_date_epoch" +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
 
+      - name: Download the web vault
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-vault
+          path: ${{ runner.temp }}/web-vault
+
+      - name: Check the web vault against its build
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/web-vault"
+          test "$(sha256sum < web-vault.sha256 | cut -d ' ' -f 1)" = "$WEB_VAULT_FILES_SHA256"
+          sha256sum --quiet --strict --check web-vault.sha256
+          test "$(jq -r .files_sha256 web-vault.json)" = "$WEB_VAULT_FILES_SHA256"
+          test "$(jq -r .patch_sha256 web-vault.json)" = \
+            "$(sha256sum < "$GITHUB_WORKSPACE/lazurio/web-vault-login-labels.patch" | cut -d ' ' -f 1)"
+
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
@@ -200,7 +255,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      # Upstream's own Dockerfile and DB features. Only linux/amd64: the
+      # Upstream's own Dockerfile and DB features; the named context replaces its
+      # stage `vault` with the patched web vault. Only linux/amd64: the
       # Conglomerate Hosts that run it are x86_64.
       - id: build
         name: Build and publish the immutable image
@@ -208,6 +264,8 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile.debian
+          build-contexts: |
+            vault=${{ runner.temp }}/web-vault
           platforms: linux/amd64
           push: true
           pull: true
@@ -241,6 +299,10 @@ jobs:
             > "$RUNNER_TEMP/invalid" 2>&1 || status=$?
           test "$status" = 12
           grep -F "\`SSO_ONLY_EXEMPT_EMAILS\` is invalid" "$RUNNER_TEMP/invalid"
+          # /web-vault in the image is exactly the patched web vault.
+          docker run --rm --network none --entrypoint sh "$IMAGE@$IMAGE_DIGEST" -c \
+            'cd / && find web-vault -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum' |
+            diff - "$RUNNER_TEMP/web-vault/web-vault.sha256"
 
       - id: attest
         name: Attest the published image
@@ -258,6 +320,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/release"
+          web_vault="$RUNNER_TEMP/web-vault/web-vault.json"
           # shellcheck disable=SC2016 # $names below are jq variables
           jq -n --sort-keys \
             --arg repository "https://github.com/$GITHUB_REPOSITORY" \
@@ -270,6 +333,7 @@ jobs:
             --arg digest "$IMAGE_DIGEST" \
             --arg attestation "$ATTESTATION_URL" \
             --arg run "$RUN_URL" \
+            --slurpfile web_vault "$web_vault" \
             '{
               schema_version: "lazurio.vaultwarden.fork-release.v1",
               source: {
@@ -290,6 +354,7 @@ jobs:
                 platforms: ["linux/amd64"],
                 dockerfile: "docker/Dockerfile.debian"
               },
+              web_vault: $web_vault[0],
               validation: {
                 workflow_run: $run,
                 image_attestation: $attestation
@@ -302,6 +367,8 @@ jobs:
             echo
             echo "- Image: \`$IMAGE:$VERSION@$IMAGE_DIGEST\` (linux/amd64)"
             echo "- Source: \`$SOURCE_SHA\`, tag \`$RELEASE_TAG\`"
+            echo "- Web vault: $(jq -r .version "$web_vault") from vaultwarden/vw_web_builds \`$(jq -r .source_commit "$web_vault")\`" \
+              "with \`$(jq -r .patch "$web_vault")\`, files sha256 \`$(jq -r .files_sha256 "$web_vault")\`"
             echo "- Image attestation: $ATTESTATION_URL"
             echo "- Workflow run: $RUN_URL"
             echo

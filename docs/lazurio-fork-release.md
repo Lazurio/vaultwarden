@@ -32,20 +32,22 @@ Rozhodnutí DEV-6631 z 2026-10-11 (systémový návrh trezoru Environmentu):
 Upstream to neumí: `SSO_ONLY=true` zavře přihlášení heslem všem účtům, i
 technickým. Overlay proto přidává výjimku pro technické účty (viz
 [Overlay](#overlay)). Navrhujeme ji upstreamu; fork ji drží, dokud upstream
-nevydá ekvivalent. Vzhled a branding zůstávají upstream; vizuální branding
-Lazuria přijde později jako samostatný overlay commit.
+nevydá ekvivalent. Vzhled a branding zůstávají upstream, jen přihlašovací
+stránka webového trezoru má popisky Lazuria (viz
+[Webový trezor](#webový-trezor)). Vizuální branding Lazuria přijde později jako
+samostatný overlay commit.
 
 ## Kanál vydání
 
 GitHub Releases tohoto repozitáře a image v GitHub Container Registry
 `ghcr.io/lazurio/vaultwarden:X.Y.Z-lazurio.N`. Každé vydání obsahuje:
 
-| Část                         | K čemu                                                                                                                                            |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| image                        | `linux/amd64` z upstream `docker/Dockerfile.debian` (DB `sqlite,mysql,postgresql`), se SBOM a provenance BuildKitu a s podepsanou attestací původu |
-| `release-evidence.json`      | zdrojový commit a tag, upstream tag a jeho commit, digest image, odkaz na attestaci a běh workflow                                                 |
-| release notes                | overlay commity, digest, attestace                                                                                                                |
-| zdrojové archivy GitHubu     | přesný zdroj tagu (viz [Zdrojový kód](#zdrojový-kód-agpl-30))                                                                                     |
+| Část                     | K čemu                                                                                                                                                                                                            |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| image                    | `linux/amd64` z upstream `docker/Dockerfile.debian` (DB `sqlite,mysql,postgresql`) s webovým trezorem z overlaye, se SBOM a provenance BuildKitu a s podepsanou attestací původu                                  |
+| `release-evidence.json`  | zdrojový commit a tag, upstream tag a jeho commit, digest image, odkaz na attestaci a běh workflow; v `web_vault` zdroj webového trezoru (commit `vaultwarden/vw_web_builds`), patch s jeho sha256 a hash souborů |
+| release notes            | overlay commity, digest, attestace, zdroj webového trezoru                                                                                                                                                        |
+| zdrojové archivy GitHubu | přesný zdroj tagu (viz [Zdrojový kód](#zdrojový-kód-agpl-30))                                                                                                                                                     |
 
 Machines image pinují **digestem**, nikdy jen tagem: `vaultwarden_image` ve
 `workloads/conglomerate-host/ansible/versions.yml` je
@@ -83,6 +85,7 @@ zvýšeným pinem a jeho apply (viz [Pin v Machines](#pin-v-machines)).
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `sso: technical accounts beside SSO_ONLY` | Výjimka technických účtů z `SSO_ONLY` (`SSO_ONLY_EXEMPT_EMAILS`, `SSO_ONLY_API_KEY`), viz níže. Mění `src/config.rs`, `src/api/identity.rs`, `src/api/core/accounts.rs`, `src/api/core/organizations.rs`, `src/api/core/emergency_access.rs`, `src/api/core/public.rs`, `src/auth.rs`, `src/mail.rs` a dokumentaci v `.env.template`; databázi nemění. | **Retain**, dokud upstream nevydá ekvivalent. Navrženo upstreamu (odkaz na PR doplň sem, až vznikne). **Drop** při první přestavbě na upstream vydání, které ekvivalent obsahuje; Machines ve stejném rolloutu přejdou na upstream jména voleb. |
 | `release: Lazurio distribution`           | Tento runbook a workflow `lazurio-fork-ci.yml` a `lazurio-release.yml`.                                                                                                                                                                               | **Retain**.                                                                                                                                                                                                                                                    |
+| `web-vault: sign in with Lazurio or with email` | Přihlašovací stránka webového trezoru říká **Přihlásit se účtem Lazurio** a **Přihlásit se e-mailem**, viz [Webový trezor](#webový-trezor). Přidává `lazurio/build-web-vault.sh` a `lazurio/web-vault-login-labels.patch`, job `Patched web vault` v `lazurio-fork-ci.yml`, job `Build the patched web vault` v `lazurio-release.yml` a popis v tomto runbooku; upstream soubory nemění. | **Retain**, dokud Lazurio chce tyto popisky. Při každé přestavbě patch přenes (viz [Přestavba](#přestavba-na-nový-upstream-tag)). **Drop**, až popisky nahradí vizuální branding Lazuria nebo upstream volba. |
 
 Vizuální branding Lazuria přijde jako samostatný overlay commit s vlastním
 řádkem v této tabulce a v allowlistu CI.
@@ -140,6 +143,50 @@ Nenastavené volby zachovají upstream chování, s jedinou výjimkou: s
 `SSO_ONLY=true` už nejde e-mailová registrace. Upstream ji pouštěl, ačkoli se
 takový účet heslem stejně nepřihlásil.
 
+### Webový trezor
+
+Overlay `web-vault: sign in with Lazurio or with email` mění na přihlašovací
+stránce webového trezoru dva popisky:
+
+| Tlačítko | Upstream (klíč)                                  | Anglicky             | Česky                      |
+| -------- | ------------------------------------------------ | -------------------- | -------------------------- |
+| SSO      | „Použít jednotné přihlášení“ (`useSingleSignOn`) | Sign in with Lazurio | Přihlásit se účtem Lazurio |
+| heslo    | „Ostatní“ (`other`)                              | Sign in with email   | Přihlásit se e-mailem      |
+
+- `lazurio/web-vault-login-labels.patch` dá oběma tlačítkům vlastní klíče
+  `lazurioSignIn` a `lazurioSignInWithEmail` s texty v `en` a `cs`; ostatní
+  jazyky ukážou angličtinu. Hodnotu `other` nemění, protože ji sdílejí i jiné
+  obrazovky. Třídy, test id a handlery tlačítek zůstávají, takže s
+  `SSO_ONLY=true` Vaultwarden „Přihlásit se e-mailem“ dál skryje
+  (`.vw-or-text` a `.vw-other-login` v
+  `src/static/templates/scss/vaultwarden.scss.hbs`). Nic jiného v rozhraní se
+  nemění.
+- `lazurio/build-web-vault.sh` sestaví webový trezor, který upstream pinuje,
+  stejně jako `dani-garcia/bw_web_builds`, jen s patchem:
+  1. Ověří, že piny odpovídají upstreamu: `VAULT_VERSION` je `vault_version` v
+     `docker/DockerSettings.yaml`, `VW_WEB_BUILDS_COMMIT` a `NODE_IMAGE` jsou
+     `ARG VAULT_VERSION` a `FROM` v `Dockerfile` bw_web_builds na tom tagu.
+     `NODE_IMAGE_DIGEST` pinuje Node image digestem.
+  2. Stáhne přesný commit `vaultwarden/vw_web_builds` a aplikuje patch
+     (`git apply`). Patch, který nejde aplikovat, sestavení zastaví.
+  3. V Node image spustí `npm ci` a `npm run dist:oss:selfhost` jako
+     `scripts/build_web_vault.sh` bw_web_builds a zapíše `vw-version.json` s
+     verzí `VAULT_VERSION`.
+  4. Zkontroluje texty v `locales/en` a `locales/cs`, že přihlašovací stránka
+     používá oba nové klíče a třídu `vw-other-login` a že `useSingleSignOn` už
+     nic nepoužívá.
+  5. Vedle webového trezoru zapíše `web-vault.sha256` (sha256 každého souboru)
+     a `web-vault.json` (piny, patch s jeho sha256, počet souborů a sha256
+     `web-vault.sha256`).
+- Image se dál staví z upstream `docker/Dockerfile.debian` beze změny:
+  `--build-context vault=<výstup build-web-vault.sh>` nahradí jeho stage
+  `vault`, tedy předpřipravený `vaultwarden/web-vault`, sestaveným webovým
+  trezorem. CI i vydání ověří, že `/web-vault` v image je přesně on.
+- npm běží jen v kontejneru Node. Ve vydání navíc v jobu bez práv k zápisu;
+  do publikujícího jobu se dostanou jen sestavené soubory ověřené hashem.
+- Webový trezor stav v GitHub Actions. Pro lab a kontrolu v prohlížeči stáhni
+  artefakt `web-vault` z běhu `Lazurio Fork CI`.
+
 ### Allowlist
 
 CI odmítne změnu jakéhokoli souboru mimo `allowed_changes` v
@@ -181,21 +228,39 @@ Upstream soubory kvůli tomu neměň.
      allowlistu;
    - `Format, lint and test`: `cargo fmt`, `cargo clippy` a `cargo test` s
      featurami release image (`sqlite,mysql,postgresql`); varování jsou chyby;
+   - `Patched web vault`: `lazurio/build-web-vault.sh` sestaví a zkontroluje
+     webový trezor s patchem (viz [Webový trezor](#webový-trezor)) a nahraje
+     ho jako artefakt `web-vault`;
    - `Release image and overlay smoke test`: image postavený stejně jako při
-     vydání, pod verzí `X.Y.Z-lazurio.0`, a smoke test bez IdP. Ověří verzi a
+     vydání, s artefaktem `web-vault` a pod verzí `X.Y.Z-lazurio.0`, a smoke
+     test bez IdP. Ověří, že `/web-vault` v image je přesně artefakt, verzi a
      odmítnutí neplatného regexu při startu. S `SSO_ONLY` ověří, že technický
      účet se zaregistruje, přihlásí heslem, obnoví relaci a přihlásí API
      klíčem, ale nezmění e-mail na adresu z výjimky, a že člověk se e-mailem
      nezaregistruje ani nepřihlásí heslem. Dále ověří, že import Directory
      Connectoru nezaloží účet s adresou z výjimky a že čekající změnu e-mailu
-     nejde dokončit, když admin mezitím přidá novou adresu do výjimky.
+     nejde dokončit, když admin mezitím přidá novou adresu do výjimky. Když
+     `Patched web vault` selže, selže i tento check.
 2. **Lab se SSO** při změně overlaye a při každé nové upstream bázi. Smoke test
-   nemá IdP, takže SSO stranu ověř v labu: image postavený lokálně (na Macu
-   stačí nativní arm64:
-   `docker build -f docker/Dockerfile.debian --build-arg DB=sqlite --build-arg VW_VERSION=X.Y.Z-lazurio.0 -t lazurio-vaultwarden:lab .`),
+   nemá IdP, takže SSO stranu ověř v labu: image postavený lokálně s
+   artefaktem `web-vault` z CI (na Macu stačí nativní arm64:
+   `gh run download <běh CI> --repo Lazurio/vaultwarden --name web-vault --dir /tmp/web-vault`
+   a
+   `docker build -f docker/Dockerfile.debian --build-context vault=/tmp/web-vault --build-arg DB=sqlite --build-arg VW_VERSION=X.Y.Z-lazurio.0 -t lazurio-vaultwarden:lab .`),
    Dex jako zástupce Lazurio Auth a připnuté `bw`, vždy s vlastním
-   `BITWARDENCLI_APPDATA_DIR`. Ověř aspoň, že:
-   - SSO odmítne přihlášení, které tvrdí adresu technického účtu;
+   `BITWARDENCLI_APPDATA_DIR`. Když overlay od posledního vydání mění jen
+   webový trezor, tedy projde
+   `git diff --quiet <tag posledního vydání> HEAD -- src macros migrations build.rs Cargo.toml Cargo.lock rust-toolchain.toml docker`,
+   smí lab místo lokálního image běžet na posledním vydaném image s artefaktem
+   `web-vault` z CI připojeným jako `WEB_VAULT_FOLDER`; Dex, připnuté `bw` a
+   vlastní `BITWARDENCLI_APPDATA_DIR` zůstávají. Stačí to, protože binárka se
+   nemění a CI staví kandidátní image a ověřuje, že jeho `/web-vault` je přesně
+   artefakt. Ověř aspoň, že:
+   - člověk v prohlížeči (česky i anglicky) projde tlačítkem SSO webového
+     trezoru přihlášením v Dexu a vrátí se do trezoru na nastavení nebo zadání
+     hlavního hesla;
+   - SSO odmítne přihlášení, které tvrdí adresu technického účtu, přes API i
+     přes toto tlačítko;
    - osobní API klíč člověka se s `SSO_ONLY_API_KEY` nepřihlásí;
    - technický účet se přes `bw` přihlásí heslem i API klíčem;
    - člověk s SSO relací si nezmění e-mail na adresu z výjimky. Nedokončí ani
@@ -206,7 +271,19 @@ Upstream soubory kvůli tomu neměň.
    - člověk, který organizaci vlastní, nezaloží importem Directory Connectoru
      účet s adresou z výjimky.
 
-   Výsledek uveď v PR. Lab D z DEV-6631 ověřuje právě tohle (21 kontrol).
+   Výsledek uveď v PR. Lab D z DEV-6631 ověřuje právě tohle (21 kontrol a
+   průchod tlačítkem SSO v prohlížeči).
+3. **Popisky v prohlížeči**, když se změní patch webového trezoru, a při každé
+   nové upstream bázi. Stačí vydaný image s artefaktem `web-vault` připojeným
+   jako `WEB_VAULT_FOLDER` a se zapnutým SSO; aby se tlačítko SSO vykreslilo,
+   stačí libovolná testovací `SSO_AUTHORITY`. Na poskytovatele identity
+   neklikej.
+   Česky i anglicky ověř, že:
+   - s `SSO_ONLY=false` ukazuje přihlašovací stránka „Přihlásit se účtem
+     Lazurio“ a „Přihlásit se e-mailem“ a druhé tlačítko vede na zadání hesla;
+   - s `SSO_ONLY=true` ukazuje jen „Přihlásit se účtem Lazurio“.
+
+   Výsledek se snímky obrazovky uveď v PR.
 
 ## Spuštění vydání
 
@@ -239,33 +316,43 @@ Workflow `Lazurio Vaultwarden Release`:
 
    Když CI ještě nedoběhlo, job selže; po zeleném CI ho spusť znovu (Re-run
    failed jobs). Tag nemaž ani nepřesouvej.
-2. **Publish image and release** čeká na schválení v environmentu `release`
+2. **Build the patched web vault** běží hned po ověření, bez práv k zápisu a
+   ještě před schválením: na ověřeném commitu spustí
+   `lazurio/build-web-vault.sh`, nahraje artefakt `web-vault` a jako výstup
+   jobu předá sha256 seznamu jeho souborů.
+3. **Publish image and release** čeká na schválení v environmentu `release`
    (viz [Schválení](#schválení)). Po schválení:
    - před jakýmkoli zápisem ověří, že environment je nastavený podle runbooku
      (proměnná `LAZURIO_VAULTWARDEN_RELEASE_CONTROL`) a že tag pořád ukazuje na
      ověřený commit;
+   - stáhne artefakt `web-vault` a ověří jeho hash proti výstupu předchozího
+     jobu a jeho patch proti tagovanému zdroji;
    - odmítne existující tag image;
-   - postaví bez cache z upstream `docker/Dockerfile.debian` image `linux/amd64`
-     s `VW_VERSION=X.Y.Z-lazurio.N` a OCI labely (zdroj, revize, licence) a
+   - postaví bez cache z upstream `docker/Dockerfile.debian` s webovým trezorem
+     z artefaktu (`--build-context vault=…`) image `linux/amd64` s
+     `VW_VERSION=X.Y.Z-lazurio.N` a OCI labely (zdroj, revize, licence) a
      pushne ho se SBOM a provenance BuildKitu;
-   - stáhne image podle digestu a ověří verzi a přítomnost overlaye (neplatný
-     `SSO_ONLY_EXEMPT_EMAILS` zastaví start);
+   - stáhne image podle digestu a ověří verzi, přítomnost overlaye (neplatný
+     `SSO_ONLY_EXEMPT_EMAILS` zastaví start) a že `/web-vault` v image je
+     přesně artefakt;
    - podepíše attestaci původu (`actions/attest-build-provenance`) a uloží ji k
      image;
    - publikuje GitHub Release jako `latest` s release notes a
-     `release-evidence.json`.
+     `release-evidence.json`, jehož `web_vault` nese zdroj webového trezoru,
+     patch s jeho sha256 a hash souborů.
 
 Když publish selže až po pushi image, zůstane tag image bez vydání. Tu verzi už
 nepoužívej a vydej další `N`.
 
 ## Schválení
 
-Až je `Verify tag, source and CI` zelené, schválí běh Matěj (nebo agent jeho
-jménem) v GitHubu: běh → Review deployments → `release` → Approve. Stejně
-funguje API `pending_deployments`. Jediný povinný schvalovatel je Matěj.
-Environment dovoluje schválit vlastní běh, protože tag vytváří Admin. Druhou
-kontrolu dělá Steward review kandidáta před zavedením do `main`. Když si
-vydání rozmyslíš, běh odmítni (Reject) a nic se nepublikuje.
+Až jsou `Verify tag, source and CI` a `Build the patched web vault` zelené,
+schválí běh Matěj (nebo agent jeho jménem) v GitHubu: běh → Review deployments
+→ `release` → Approve. Stejně funguje API `pending_deployments`. Jediný
+povinný schvalovatel je Matěj. Environment dovoluje schválit vlastní běh,
+protože tag vytváří Admin. Druhou kontrolu dělá Steward review kandidáta před
+zavedením do `main`. Když si vydání rozmyslíš, běh odmítni (Reject) a nic se
+nepublikuje.
 
 ## Ověření publikovaného vydání
 
@@ -278,6 +365,9 @@ DIGEST="$(jq -r .artifact.digest release-evidence.json)"
 gh attestation verify "oci://ghcr.io/lazurio/vaultwarden@$DIGEST" --repo Lazurio/vaultwarden
 docker buildx imagetools inspect "ghcr.io/lazurio/vaultwarden:$VERSION" | grep -m1 '^Digest:'   # = $DIGEST
 docker run --rm --platform linux/amd64 --entrypoint /vaultwarden "$REFERENCE" --version         # Vaultwarden X.Y.Z-lazurio.N
+jq .web_vault release-evidence.json                                                               # zdroj webového trezoru, patch, hash souborů
+docker run --rm --platform linux/amd64 --entrypoint sh "$REFERENCE" -c \
+  'cd / && find web-vault -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum' | sha256sum    # = .web_vault.files_sha256
 ```
 
 ## Pin v Machines
@@ -330,12 +420,24 @@ Task Agent na jeho výslovný pokyn vázaný na obě SHA.
    všechno, co už upstream umí.
 3. V `lazurio-fork-ci.yml` aktualizuj `UPSTREAM_TAG` a `UPSTREAM_SHA` a projdi
    allowlist.
-4. Otevři PR `lazurio/X.Y.Z` → `upstream/X.Y.Z`; jeho diff je přesně overlay.
-   Počkej na zelené `Lazurio Fork CI`, udělej lab podle
-   [Testování](#testování-před-vydáním) a nech PR zreviewovat. Pak předej
-   Adminovi přesný starý `main` (`expected_old_main`) a přesný nový head
-   (`candidate_head`) s odkazem na zelený běh.
-5. Než se `main` přepne, musí být současný `main` zachycený publikovaným
+4. Přenes patch webového trezoru. Když nová báze mění `vault_version` v
+   `docker/DockerSettings.yaml`, `Patched web vault` selže na pinech v
+   `lazurio/build-web-vault.sh`. Nastav `VAULT_VERSION` na novou hodnotu,
+   `VW_WEB_BUILDS_COMMIT` a `NODE_IMAGE` podle `ARG VAULT_VERSION` a `FROM` v
+   `Dockerfile` `dani-garcia/bw_web_builds` na tom tagu a `NODE_IMAGE_DIGEST`
+   na aktuální digest toho Node image
+   (`docker buildx imagetools inspect node:24-trixie`). Patch aplikuj na nový
+   commit `vaultwarden/vw_web_builds` (`git apply --3way`). Když neprojde,
+   uprav ho podle záměru (stejné dva klíče a texty, nic dalšího), vygeneruj
+   ho znovu přes `git diff` nad přesným commitem a aktualizuj jeho hlavičku.
+   Patch, který nejde aplikovat, CI i vydání hlasitě zastaví; tiše se nikdy
+   nevynechá. Když se `vault_version` nemění, CI patch jen znovu ověří.
+5. Otevři PR `lazurio/X.Y.Z` → `upstream/X.Y.Z`; jeho diff je přesně overlay.
+   Počkej na zelené `Lazurio Fork CI`, udělej lab a kontrolu popisků v
+   prohlížeči podle [Testování](#testování-před-vydáním) a nech PR
+   zreviewovat. Pak předej Adminovi přesný starý `main` (`expected_old_main`)
+   a přesný nový head (`candidate_head`) s odkazem na zelený běh.
+6. Než se `main` přepne, musí být současný `main` zachycený publikovaným
    **immutable** vydáním `v…-lazurio.N`. Tag vydání míří buď přesně na starý
    `main`, nebo na jeho předka, od kterého se starý `main` liší jen v `docs/`.
    Ověř to:
@@ -352,7 +454,7 @@ Task Agent na jeho výslovný pokyn vázaný na obě SHA.
 
    Pokud starý `main` mění proti poslednímu vydání cokoli mimo `docs/`, vydej ho
    nejdřív. Docs commity starého `main` přenes do candidate.
-6. Admin vymění `main`:
+7. Admin vymění `main`:
 
    ```bash
    git push --force-with-lease="refs/heads/main:$expected_old_main" \
@@ -361,7 +463,7 @@ Task Agent na jeho výslovný pokyn vázaný na obě SHA.
 
    Neúspěšný lease znamená souběžnou změnu. Nikdy ho automaticky neopakuj. PR
    do `upstream/X.Y.Z` se nemerguje; zavři ho s odkazem na nový `main`.
-7. Z nového `main` vydej `X.Y.Z-lazurio.1` a pinni ho v Machines.
+8. Z nového `main` vydej `X.Y.Z-lazurio.1` a pinni ho v Machines.
 
 ### První zavedení `main`
 
@@ -397,7 +499,8 @@ zůstává zapsaný pro kontrolu:
 - Ruleset pro `main`: jen rebase merge, lineární historie, povinné checky
   `Overlay on the upstream tag`, `Format, lint and test` a
   `Release image and overlay smoke test`; force push jen bypassem Organization
-  Admina (přestavba a první zavedení).
+  Admina (přestavba a první zavedení). `Patched web vault` povinný být
+  nemusí: když selže, selže i `Release image and overlay smoke test`.
 - Ruleset pro tagy `v*-lazurio.*`: zákaz update a smazání; vytvořit je smí jen
   Organization Admin (bypass).
 - Release immutability v nastavení repozitáře (Settings → General → Releases),
