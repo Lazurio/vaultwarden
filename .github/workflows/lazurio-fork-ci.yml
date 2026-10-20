@@ -1,8 +1,9 @@
 name: Lazurio Fork CI
 
 # Read-only CI for the Lazurio overlay on upstream Vaultwarden: the overlay sits on
-# the exact upstream tag, changes only reviewed files, passes the Rust checks, and
-# its release image builds and enforces the SSO_ONLY exemption.
+# the exact upstream tag, changes only reviewed files, passes the Rust checks, its
+# patched web vault builds with the Lazurio login labels, and its release image
+# builds with that web vault and enforces the SSO_ONLY exemption.
 # Runbook: docs/lazurio-fork-release.md.
 
 on:
@@ -71,6 +72,9 @@ jobs:
             .github/workflows/lazurio-fork-ci.yml
             .github/workflows/lazurio-release.yml
             docs/lazurio-fork-release.md
+            # web-vault: sign in with Lazurio or with email.
+            lazurio/build-web-vault.sh
+            lazurio/web-vault-login-labels.patch
           )
           unexpected="$(git diff --no-renames --name-only "$UPSTREAM_SHA" HEAD |
             grep -vxF -f <(printf '%s\n' "${allowed_changes[@]}") || true)"
@@ -124,12 +128,10 @@ jobs:
       - name: Test
         run: cargo test --profile ci --features "$FEATURES"
 
-  image:
-    name: Release image and overlay smoke test
+  web-vault:
+    name: Patched web vault
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      IMAGE: lazurio/vaultwarden:ci
+    timeout-minutes: 45
     steps:
       - name: Checkout the exact source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -137,16 +139,68 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
 
-      # The same Dockerfile and build arguments as the release, under the
-      # never-released version <upstream>-lazurio.0. Nothing is published.
+      # The web vault upstream pins, with the Lazurio login labels, built as the
+      # release builds it. Fails when a pin no longer matches upstream, the patch
+      # no longer applies, or the built login page lacks the labels.
+      - name: Build and check the patched web vault
+        run: lazurio/build-web-vault.sh "$RUNNER_TEMP/web-vault"
+
+      - name: Upload the web vault
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-vault
+          path: ${{ runner.temp }}/web-vault/
+          if-no-files-found: error
+          include-hidden-files: true
+
+  image:
+    name: Release image and overlay smoke test
+    needs: web-vault
+    # Also runs when the web vault failed, to fail: a required check that GitHub
+    # skips would count as passed.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      IMAGE: lazurio/vaultwarden:ci
+    steps:
+      - name: Require the patched web vault
+        env:
+          WEB_VAULT_RESULT: ${{ needs.web-vault.result }}
+        run: test "$WEB_VAULT_RESULT" = success
+
+      - name: Checkout the exact source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Download the web vault
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: web-vault
+          path: ${{ runner.temp }}/web-vault
+
+      # The same Dockerfile, web vault and build arguments as the release, under
+      # the never-released version <upstream>-lazurio.0. Nothing is published.
       - name: Build the release image without publishing
         run: |
           set -euo pipefail
           docker build \
             --file docker/Dockerfile.debian \
+            --build-context vault="$RUNNER_TEMP/web-vault" \
             --build-arg VW_VERSION="${UPSTREAM_TAG}-lazurio.0" \
             --tag "$IMAGE" \
             .
+
+      # The named context replaced upstream's prebuilt web vault: /web-vault in
+      # the image is exactly the patched web vault.
+      - name: Check the web vault in the image
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --entrypoint sh "$IMAGE" -c \
+            'cd / && find web-vault -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum' |
+            diff - "$RUNNER_TEMP/web-vault/web-vault.sha256"
 
       # Without an identity provider: the version, the configuration check, and
       # what SSO_ONLY with SSO_ONLY_EXEMPT_EMAILS and SSO_ONLY_API_KEY allow and

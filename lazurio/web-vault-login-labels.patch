@@ -1,0 +1,66 @@
+Lazurio overlay "web-vault: sign in with Lazurio or with email", for
+vaultwarden/vw_web_builds d2a095eb800fe80a9bc524579b974796eae51994 (web vault
+v2026.7.0).
+
+The login page says "Sign in with Lazurio" for SSO and "Sign in with email" for
+the master password path, instead of "Use single sign-on" and "Other". Both
+buttons get their own keys, because `other` is shared with other screens. Only
+English and Czech carry the texts; every other language falls back to English.
+The buttons keep their classes, test ids and handlers, so Vaultwarden's
+SSO_ONLY stylesheet still hides the email path.
+
+lazurio/build-web-vault.sh applies this patch with `git apply`.
+Runbook: docs/lazurio-fork-release.md.
+
+diff --git a/apps/web/src/locales/cs/messages.json b/apps/web/src/locales/cs/messages.json
+index 7871fa4..6d27f7e 100644
+--- a/apps/web/src/locales/cs/messages.json
++++ b/apps/web/src/locales/cs/messages.json
+@@ -1,4 +1,10 @@
+ {
++  "lazurioSignIn": {
++    "message": "Přihlásit se účtem Lazurio"
++  },
++  "lazurioSignInWithEmail": {
++    "message": "Přihlásit se e-mailem"
++  },
+   "allApplications": {
+     "message": "Všechny aplikace"
+   },
+diff --git a/apps/web/src/locales/en/messages.json b/apps/web/src/locales/en/messages.json
+index ca014ef..ef72173 100644
+--- a/apps/web/src/locales/en/messages.json
++++ b/apps/web/src/locales/en/messages.json
+@@ -1,4 +1,10 @@
+ {
++  "lazurioSignIn": {
++    "message": "Sign in with Lazurio"
++  },
++  "lazurioSignInWithEmail": {
++    "message": "Sign in with email"
++  },
+   "allApplications": {
+     "message": "All applications"
+   },
+diff --git a/libs/auth/src/angular/login/login.component.html b/libs/auth/src/angular/login/login.component.html
+index 0d5ae2e..7ffed63 100644
+--- a/libs/auth/src/angular/login/login.component.html
++++ b/libs/auth/src/angular/login/login.component.html
+@@ -64,7 +64,7 @@
+         (click)="handleSsoClick()"
+       >
+         <bit-icon name="bwi-provider" class="tw-mr-1"></bit-icon>
+-        {{ "useSingleSignOn" | i18n }}
++        {{ "lazurioSignIn" | i18n }}
+       </button>
+
+       <div class="tw-text-center vw-or-text">{{ "or" | i18n }}</div>
+@@ -99,7 +99,7 @@
+         class="vw-other-login"
+         [disabled]="ssoRequired"
+       >
+-        {{ "other" | i18n }}
++        {{ "lazurioSignInWithEmail" | i18n }}
+       </button>
+     </div>
+   </div>
